@@ -1,3 +1,4 @@
+
 import os
 import re
 import csv
@@ -55,7 +56,10 @@ ADMIN_PASSWORD_HASH = get_setting("ADMIN_PASSWORD_HASH", "")
 USE_POSTGRES = bool(DATABASE_URL)
 
 if USE_POSTGRES and psycopg is None:
-    st.error("PostgreSQL driver is missing. Run: python -m pip install psycopg[binary]")
+    st.error(
+        "PostgreSQL driver is missing. "
+        "Run: python -m pip install psycopg[binary]"
+    )
     st.stop()
 
 
@@ -244,13 +248,15 @@ initialize_database()
 
 # --------------------------------------------------
 # PASSWORD VERIFICATION
-# Supports Werkzeug PBKDF2 and scrypt hashes
+# Supports PBKDF2 and scrypt hashes
 # --------------------------------------------------
 
 def verify_password(password, stored_hash):
 
+    # Security: never allow a default password.
+    # Admin login fails if no password hash is configured.
     if not stored_hash:
-        return password == "CivicFix@123"
+        return False
 
     try:
         method, salt, expected_hash = stored_hash.split("$")
@@ -285,7 +291,10 @@ def verify_password(password, stored_hash):
         else:
             return False
 
-        return hmac.compare_digest(actual_hash, expected_hash)
+        return hmac.compare_digest(
+            actual_hash,
+            expected_hash
+        )
 
     except Exception:
         return False
