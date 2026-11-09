@@ -50,16 +50,13 @@ def get_setting(name, default=""):
 
 
 DATABASE_URL = get_setting("DATABASE_URL", "")
-ADMIN_USERNAME = get_setting("ADMIN_USERNAME", "admin")
+ADMIN_USERNAME = get_setting("ADMIN_USERNAME", "civicfix_admin")
 ADMIN_PASSWORD_HASH = get_setting("ADMIN_PASSWORD_HASH", "")
 
 USE_POSTGRES = bool(DATABASE_URL)
 
 if USE_POSTGRES and psycopg is None:
-    st.error(
-        "PostgreSQL driver is missing. "
-        "Run: python -m pip install psycopg[binary]"
-    )
+    st.error("PostgreSQL driver is missing.")
     st.stop()
 
 
@@ -111,7 +108,6 @@ def execute_query(sql, params=(), fetch=None):
 # --------------------------------------------------
 
 def initialize_database():
-
     connection = get_connection()
 
     try:
@@ -248,40 +244,54 @@ initialize_database()
 
 # --------------------------------------------------
 # PASSWORD VERIFICATION
-# Supports PBKDF2 and scrypt hashes
 # --------------------------------------------------
 
 def verify_password(password, stored_hash):
 
-    # Security: never allow a default password.
-    # Admin login fails if no password hash is configured.
-    if not stored_hash:
+    if not stored_hash or not isinstance(stored_hash, str):
         return False
 
     try:
         method, salt, expected_hash = stored_hash.split("$")
 
+        if not salt or not expected_hash:
+            return False
+
         if method.startswith("pbkdf2:"):
             parts = method.split(":")
+
+            if len(parts) != 3:
+                return False
+
             algorithm = parts[1]
-            iterations = int(parts[2]) if len(parts) > 2 else 600000
+            iterations = int(parts[2])
+
+            if algorithm not in ("sha256", "sha512"):
+                return False
+
+            if iterations < 1:
+                return False
 
             actual_hash = hashlib.pbkdf2_hmac(
                 algorithm,
-                password.encode(),
-                salt.encode(),
+                password.encode("utf-8"),
+                salt.encode("utf-8"),
                 iterations
             ).hex()
 
         elif method.startswith("scrypt:"):
             parts = method.split(":")
+
+            if len(parts) != 4:
+                return False
+
             n = int(parts[1])
             r = int(parts[2])
             p = int(parts[3])
 
             actual_hash = hashlib.scrypt(
-                password.encode(),
-                salt=salt.encode(),
+                password.encode("utf-8"),
+                salt=salt.encode("utf-8"),
                 n=n,
                 r=r,
                 p=p,
@@ -296,7 +306,7 @@ def verify_password(password, stored_hash):
             expected_hash
         )
 
-    except Exception:
+    except (ValueError, TypeError, OverflowError):
         return False
 
 
@@ -351,6 +361,7 @@ if st.session_state.admin_logged_in:
 page = st.sidebar.radio("Navigation", pages)
 
 st.sidebar.divider()
+
 st.sidebar.info(
     "CivicFix helps citizens submit complaints "
     "and track their resolution."
@@ -358,7 +369,7 @@ st.sidebar.info(
 
 
 # --------------------------------------------------
-# HOME PAGE - COMPLAINT SUBMISSION
+# HOME PAGE
 # --------------------------------------------------
 
 if page == "Home":
@@ -420,50 +431,75 @@ if page == "Home":
                 st.error("Please enter a valid email address.")
 
             else:
-
                 tracking_code = create_tracking_code()
 
                 try:
-                    execute_query("""
-                        INSERT INTO reports
-                        (
-                            name,
-                            email,
+                    connection = get_connection()
+
+                    try:
+                        cursor = connection.cursor()
+
+                        if USE_POSTGRES:
+                            insert_sql = """
+                                INSERT INTO reports
+                                (name, email, category, location,
+                                 description, status, tracking_code)
+                                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                                RETURNING id
+                            """
+                        else:
+                            insert_sql = """
+                                INSERT INTO reports
+                                (name, email, category, location,
+                                 description, status, tracking_code)
+                                VALUES (?, ?, ?, ?, ?, ?, ?)
+                            """
+
+                        cursor.execute(insert_sql, (
+                            name.strip(),
+                            email.strip(),
                             category,
-                            location,
-                            description,
-                            status,
+                            location.strip(),
+                            description.strip(),
+                            "Submitted",
                             tracking_code
-                        )
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """, (
-                        name.strip(),
-                        email.strip(),
-                        category,
-                        location.strip(),
-                        description.strip(),
-                        "Submitted",
-                        tracking_code
-                    ))
+                        ))
 
-                    report = execute_query("""
-                        SELECT id FROM reports
-                        WHERE tracking_code = ?
-                    """, (tracking_code,), fetch="one")
+                        if USE_POSTGRES:
+                            report_id = cursor.fetchone()["id"]
+                        else:
+                            report_id = cursor.lastrowid
 
-                    execute_query("""
-                        INSERT INTO status_history
-                        (report_id, old_status, new_status, remarks)
-                        VALUES (?, ?, ?, ?)
-                    """, (
-                        report["id"],
-                        None,
-                        "Submitted",
-                        "Complaint successfully submitted"
-                    ))
+                        if USE_POSTGRES:
+                            history_sql = """
+                                INSERT INTO status_history
+                                (report_id, old_status, new_status, remarks)
+                                VALUES (%s, %s, %s, %s)
+                            """
+                        else:
+                            history_sql = """
+                                INSERT INTO status_history
+                                (report_id, old_status, new_status, remarks)
+                                VALUES (?, ?, ?, ?)
+                            """
+
+                        cursor.execute(history_sql, (
+                            report_id,
+                            None,
+                            "Submitted",
+                            "Complaint successfully submitted"
+                        ))
+
+                        connection.commit()
+
+                    except Exception:
+                        connection.rollback()
+                        raise
+
+                    finally:
+                        connection.close()
 
                     st.success("Complaint submitted successfully!")
-
                     st.subheader("Your Tracking ID")
                     st.code(tracking_code)
 
@@ -472,8 +508,10 @@ if page == "Home":
                         "and your email address to track your complaint."
                     )
 
-                except Exception as error:
-                    st.error(f"Could not submit complaint: {error}")
+                except Exception:
+                    st.error(
+                        "Could not submit complaint. Please try again."
+                    )
 
 
 # --------------------------------------------------
@@ -594,8 +632,14 @@ elif page == "Admin Login":
         if login_button:
 
             if (
-                username == ADMIN_USERNAME
-                and verify_password(password, ADMIN_PASSWORD_HASH)
+                hmac.compare_digest(
+                    username,
+                    str(ADMIN_USERNAME)
+                )
+                and verify_password(
+                    password,
+                    ADMIN_PASSWORD_HASH
+                )
             ):
                 st.session_state.admin_logged_in = True
                 st.success("Login successful!")
@@ -627,14 +671,17 @@ elif page == "Admin Dashboard":
     """, fetch="all")
 
     total = len(reports)
+
     submitted_count = sum(
         1 for report in reports
         if report["status"] == "Submitted"
     )
+
     progress_count = sum(
         1 for report in reports
         if report["status"] == "In Progress"
     )
+
     resolved_count = sum(
         1 for report in reports
         if report["status"] == "Resolved"
@@ -778,29 +825,59 @@ elif page == "Admin Dashboard":
 
                 else:
 
-                    execute_query("""
-                        UPDATE reports
-                        SET status = ?
-                        WHERE id = ?
-                    """, (new_status, selected_id))
+                    connection = get_connection()
 
-                    execute_query("""
-                        INSERT INTO status_history
-                        (
-                            report_id,
-                            old_status,
-                            new_status,
-                            remarks
+                    try:
+                        cursor = connection.cursor()
+
+                        if USE_POSTGRES:
+                            update_sql = """
+                                UPDATE reports
+                                SET status = %s
+                                WHERE id = %s
+                            """
+                            history_sql = """
+                                INSERT INTO status_history
+                                (report_id, old_status, new_status, remarks)
+                                VALUES (%s, %s, %s, %s)
+                            """
+                        else:
+                            update_sql = """
+                                UPDATE reports
+                                SET status = ?
+                                WHERE id = ?
+                            """
+                            history_sql = """
+                                INSERT INTO status_history
+                                (report_id, old_status, new_status, remarks)
+                                VALUES (?, ?, ?, ?)
+                            """
+
+                        cursor.execute(
+                            update_sql,
+                            (new_status, selected_id)
                         )
-                        VALUES (?, ?, ?, ?)
-                    """, (
-                        selected_id,
-                        selected_report["status"],
-                        new_status,
-                        remarks.strip()
-                    ))
 
-                    st.success("Complaint status updated successfully!")
+                        cursor.execute(
+                            history_sql,
+                            (
+                                selected_id,
+                                selected_report["status"],
+                                new_status,
+                                remarks.strip()
+                            )
+                        )
+
+                        connection.commit()
+                        st.success("Complaint status updated successfully!")
+
+                    except Exception:
+                        connection.rollback()
+                        st.error("Could not update complaint status.")
+
+                    finally:
+                        connection.close()
+
                     st.rerun()
 
     else:
@@ -828,6 +905,7 @@ elif page == "Admin Dashboard":
             })
 
         csv_buffer = io.StringIO()
+
         writer = csv.DictWriter(
             csv_buffer,
             fieldnames=csv_data[0].keys()
